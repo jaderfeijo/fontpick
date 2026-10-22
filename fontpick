@@ -1,0 +1,372 @@
+#!/bin/bash
+# fontpick - browse, preview, install and set the Omarchy monospace font.
+#
+#   enter   apply the font and its size system-wide (or install a ↓ row)
+#   ctrl-↑/↓ (or alt-↑/↓)  change the size; it's remembered per font
+#   ctrl-t  open a real foot window in that font, without applying it
+#   ctrl-a  toggle showing installable Nerd Fonts
+#   esc     quit
+#
+# Previews are rendered with pango-view in the current theme's colours and
+# shown inline as sixel images, so they need a sixel terminal (foot works).
+
+set -o pipefail
+shopt -u patsub_replacement 2>/dev/null  # keep "&" literal in ${var//x/y}
+
+SELF=$(realpath "$0")
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/fontpick"
+RUNTIME="${XDG_RUNTIME_DIR:-/tmp}/fontpick-$UID"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/fontpick"
+SIZES="$STATE/sizes"
+THEME="$HOME/.local/state/omarchy/current/theme"
+mkdir -p "$CACHE" "$RUNTIME" "$STATE"
+
+theme_color() {
+  local v
+  v=$(sed -n -E "s/^$1[[:space:]]*=[[:space:]]*\"(#[0-9a-fA-F]{6})\".*/\1/p" "$THEME/colors.toml" 2>/dev/null | head -1)
+  echo "${v:-$2}"
+}
+
+markup_escape() {
+  local s=${1//&/&amp;}
+  s=${s//</&lt;}
+  s=${s//>/&gt;}
+  s=${s//\"/&quot;}
+  printf '%s' "$s"
+}
+
+# omarchy-font-set's fontconfig rule puts the system font first for any pattern
+# that falls back to "monospace", which hijacks requests for other monospace
+# fonts. Previews and try windows use a config without the user rules instead.
+isolated_fontconfig() {
+  local dir="$RUNTIME/fontconfig"
+  if [[ ! -s $dir/fonts.conf ]]; then
+    mkdir -p "$dir/conf.d"
+    local f
+    for f in /etc/fonts/conf.d/*.conf; do
+      [[ $(basename "$f") == 50-user.conf ]] || ln -sf "$f" "$dir/conf.d/"
+    done
+    sed "s|<include ignore_missing=\"yes\">conf.d</include>|<include ignore_missing=\"yes\">$dir/conf.d</include>|" \
+      /etc/fonts/fonts.conf >"$dir/fonts.conf"
+  fi
+  echo "$dir/fonts.conf"
+}
+
+has_nerd_glyphs() {
+  [[ -n $(fc-list ":family=$1:charset=e0b0 f418" family 2>/dev/null) ]]
+}
+
+# The size the terminals use now, read from foot.ini (kept in sync on apply).
+current_size() {
+  local s
+  s=$(sed -n -E 's/^font=.*:size=([0-9.]+).*/\1/p' "$HOME/.config/foot/foot.ini" 2>/dev/null | head -1)
+  echo "${s:-9}"
+}
+
+# Size remembered for a font, defaulting to the current terminal size.
+font_size() {
+  local s
+  s=$(awk -F'\t' -v f="$1" '$1 == f { s = $2 } END { print s }' "$SIZES" 2>/dev/null)
+  echo "${s:-$(current_size)}"
+}
+
+remember_size() {
+  local tmp="$SIZES.tmp"
+  { awk -F'\t' -v f="$1" '$1 != f' "$SIZES" 2>/dev/null; printf '%s\t%s\n' "$1" "$2"; } >"$tmp"
+  mv "$tmp" "$SIZES"
+}
+
+# Step a font's size by a delta, in half points, between 5 and 32.
+step_size() {
+  remember_size "$1" "$(awk -v s="$(font_size "$1")" -v d="$2" 'BEGIN {
+    s = int((s + d) * 2 + 0.5) / 2
+    if (s < 5) s = 5
+    if (s > 32) s = 32
+    print s
+  }')"
+}
+
+# Character advance of a monospace font as a fraction of its pixel size,
+# measured with pango (100 characters at 100px).
+advance_ratio() {
+  local cache
+  cache="$RUNTIME/advance-$(printf '%s' "$1" | md5sum | cut -c1-12)"
+  if [[ ! -s $cache ]]; then
+    local png="$RUNTIME/advance-$$.png"
+    FONTCONFIG_FILE=$(isolated_fontconfig) pango-view --pixels --font="$1 100" --margin=0 \
+      --text="$(printf 'M%.0s' {1..100})" -q -o "$png" 2>/dev/null &&
+      magick identify -format '%w' "$png" 2>/dev/null | awk '{ print $1 / 10000 }' >"$cache"
+    rm -f "$png"
+  fi
+  cat "$cache" 2>/dev/null
+}
+
+# Apply a size to every terminal config omarchy-font-set touches.
+apply_size() {
+  local family=$1 size=$2
+  [[ -f ~/.config/foot/foot.ini ]] &&
+    sed -i "s/^font=.*/font=$family:size=$size/" ~/.config/foot/foot.ini
+  [[ -f ~/.config/alacritty/alacritty.toml ]] &&
+    sed -i "/^\[font\]/,/^\[/ s/^size = .*/size = $size/" ~/.config/alacritty/alacritty.toml
+  if [[ -f ~/.config/kitty/kitty.conf ]]; then
+    sed --follow-symlinks -i -E "s/^[[:space:]]*font_size[[:space:]]+.*/font_size $size/" ~/.config/kitty/kitty.conf
+    pkill -USR1 kitty
+  fi
+  if [[ -f ~/.config/ghostty/config ]]; then
+    sed -i "s/^font-size = .*/font-size = $size/" ~/.config/ghostty/config
+    pkill -SIGUSR2 ghostty
+  fi
+}
+
+# Rows: kind <tab> label <tab> value   (kind = font|pkg, value = family|package)
+list_rows() {
+  local current show_pkgs=0
+  [[ -f $RUNTIME/show-pkgs ]] && show_pkgs=1
+  current=$(omarchy-font-current 2>/dev/null)
+
+  while IFS= read -r family; do
+    [[ -z $family ]] && continue
+    local mark="  " tag=""
+    [[ $family == "$current" ]] && mark=$'\e[32m✓\e[0m '
+    has_nerd_glyphs "$family" && tag=$' \e[2m nerd\e[0m'
+    printf 'font\t%s%s%s\t%s\n' "$mark" "$family" "$tag" "$family"
+  done < <(omarchy-font-list)
+
+  ((show_pkgs)) || return 0
+
+  local avail="$RUNTIME/nerd-packages"
+  if [[ ! -s $avail ]]; then
+    pacman -Ssq '^(ttf|otf)-.*-nerd$' 2>/dev/null |
+      grep -v -E 'symbols|-basic$' | sort -u >"$avail"
+  fi
+  comm -23 "$avail" <(pacman -Qq | sort) | while IFS= read -r pkg; do
+    local name=${pkg#*-}
+    name=${name%-nerd}
+    printf 'pkg\t\e[2m↓ %s  (%s)\e[0m\t%s\n' "$name" "$pkg" "$pkg"
+  done
+}
+
+cell_size() {
+  # Pixel size of one terminal cell, from the tty's winsize (what fzf uses too)
+  python3 -I -c '
+import fcntl, os, struct, termios
+fd = os.open("/dev/tty", os.O_RDONLY)
+rows, cols, xpix, ypix = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, bytes(8)))
+if rows and cols and xpix and ypix:
+    print(xpix / cols, ypix / rows)
+' 2>/dev/null
+}
+
+# The sample shown in both the preview and the ctrl-t window, so they can be
+# compared like for like. @x@ tokens switch colour: f=foreground, d=muted,
+# 1-5=accents.
+sample_text() {
+  local branch=$'' prompt=$'❯'
+  local glyphs=$'       \U000f02a2 \U000f0219  \U000f0156 '
+  cat <<EOF
+The quick brown fox jumps over the lazy dog
+ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz
+0123456789 !@#\$%^&*() {}[] <> ~\`'" |\\/   0O Il1| rn m
+
+@d@// operators:  => -> != === <= >= :: && || /* */@f@
+@4@fn@f@ @1@render@f@(ctx: @3@&mut Context@f@, items: @3@Vec@f@<@3@Item@f@>) -> @3@Result@f@<()> {
+    @4@for@f@ (i, item) @4@in@f@ items.iter().enumerate() {
+        @4@if@f@ item.width >= @5@0x1F@f@ && i != @5@0@f@ {
+            ctx.draw(@2@"item {i}: {}"@f@, item.name)?;
+        }
+    }
+    Ok(())
+}
+
+@2@~/Work@f@ @1@$branch main@f@ @4@$prompt@f@ ls -la
+@d@Nerd glyphs:@f@ $glyphs
+EOF
+}
+
+# Theme colours for the sample tokens, as "token hex" lines.
+sample_palette() {
+  echo "f $(theme_color foreground '#cdd6f4')"
+  echo "d $(theme_color muted '#6c7086')"
+  echo "1 $(theme_color blue '#89b4fa')"
+  echo "2 $(theme_color green '#a6e3a1')"
+  echo "3 $(theme_color yellow '#f9e2af')"
+  echo "4 $(theme_color magenta '#cba6f7')"
+  echo "5 $(theme_color bright_red '#f38ba8')"
+}
+
+sample_ansi() {
+  local text tok hex
+  text=$(sample_text)
+  while read -r tok hex; do
+    text=${text//@$tok@/$(printf '\e[38;2;%d;%d;%dm' "0x${hex:1:2}" "0x${hex:3:2}" "0x${hex:5:2}")}
+  done < <(sample_palette)
+  printf '%s\e[0m\n' "$text"
+}
+
+sample_markup() {
+  local text tok hex fg
+  text=$(sample_text)
+  text=${text//&/&amp;}
+  text=${text//</&lt;}
+  text=${text//>/&gt;}
+  while read -r tok hex; do
+    [[ $tok == f ]] && fg=$hex
+    text=${text//@$tok@/</span><span foreground=\"$hex\">}
+  done < <(sample_palette)
+  printf '<span foreground="%s">%s</span>' "$fg" "$text"
+}
+
+# foot and alacritty don't draw programming ligatures; kitty and ghostty do.
+terminal_has_ligatures() {
+  case "$(omarchy-default-terminal 2>/dev/null)" in
+    kitty | ghostty) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+render_preview() {
+  local family=$1 cols=$2 lines=$3
+  local cw=0 ch=0
+  read -r cw ch < <(cell_size)
+
+  local current size
+  current=$(omarchy-font-current 2>/dev/null)
+  size=$(font_size "$family")
+  printf '\e[1m%s\e[0m  %spt' "$family" "$size"
+  [[ $family == "$current" ]] && printf '  \e[32m(current)\e[0m'
+  printf '  \e[2mctrl-↑/↓ size\e[0m\n'
+  if has_nerd_glyphs "$family"; then
+    echo $'\e[2mHas its own Nerd Font icons · enter to apply · ctrl-t to try in foot\e[0m'
+  else
+    echo $'\e[33mNo Nerd Font icons\e[0m\e[2m (borrowed from another font) · enter to apply · ctrl-t to try\e[0m'
+  fi
+
+  if [[ -z $cw || -z $ch ]]; then
+    echo
+    echo "(Terminal didn't report its cell size, so no image preview.)"
+    return
+  fi
+
+  local width height
+  width=$(awk -v c="$cols" -v w="$cw" 'BEGIN { printf "%d", (c - 2) * w }')
+  height=$(awk -v l="$lines" -v h="$ch" 'BEGIN { printf "%d", (l - 4) * h }')
+  ((width > 0 && height > 0)) || return
+
+  # Draw the text at the size the terminal would: a cell of the current font
+  # at the current size is $cw pixels wide, so scale from that.
+  local cur_size ratio body features=""
+  cur_size=$(current_size)
+  ratio=$(advance_ratio "$current")
+  body=$(awk -v cw="$cw" -v r="${ratio:-0.6}" -v cs="$cur_size" -v s="$size" \
+    'BEGIN { if (r <= 0) r = 0.6; printf "%.2f", cw / r / cs * s }')
+  terminal_has_ligatures || features=' font_features="liga 0, clig 0, calt 0, dlig 0"'
+
+  local bg key out
+  bg=$(theme_color background '#1e1e2e')
+  key=$( { printf '%s|%s|%s|%s|%s|%s\n' "$family" "$width" "$height" "$body" "$bg" "$features"; sample_palette; } | md5sum | cut -c1-16)
+  out="$CACHE/$key.six"
+
+  if [[ ! -s $out ]]; then
+    local fam markup png="$RUNTIME/preview-$$.png"
+    fam=$(markup_escape "$family")
+    markup="<span font_family=\"$fam\" size=\"${body}pt\"$features>$(sample_markup)</span>"
+    if ! FONTCONFIG_FILE=$(isolated_fontconfig) pango-view --pixels --font="monospace $body" --markup --text="$markup" \
+        --background="$bg" --margin="${ch%.*} ${cw%.*}" -q -o "$png" 2>"$RUNTIME/pango.err"; then
+      echo
+      sed 's/^/pango: /' "$RUNTIME/pango.err" | head -5
+      return
+    fi
+    magick "$png" -background "$bg" -gravity northwest -crop "${width}x${height}+0+0" +repage sixel:- >"$out" 2>/dev/null
+    rm -f "$png"
+  fi
+  cat "$out"
+}
+
+package_preview() {
+  local pkg=$1
+  printf '\e[1m%s\e[0m  \e[2m(not installed)\e[0m\n\n' "$pkg"
+  pacman -Si "$pkg" 2>/dev/null | grep -E '^(Description|Version|URL|Installed Size)'
+  echo
+  echo $'\e[2mPress enter to install it. It then appears in the list with a\npreview, ready to apply.\e[0m'
+}
+
+case "${1-}" in
+  _list)
+    list_rows
+    exit
+    ;;
+  _preview)
+    if [[ $2 == pkg ]]; then
+      package_preview "$3"
+    else
+      render_preview "$3" "${FZF_PREVIEW_COLUMNS:-80}" "${FZF_PREVIEW_LINES:-30}"
+    fi
+    exit
+    ;;
+  _enter)
+    if [[ $2 == pkg ]]; then
+      clear
+      echo "Installing $3..."
+      omarchy-pkg-add "$3" && fc-cache -f >/dev/null
+      echo
+      read -rsn1 -p "Done. Press any key to return."
+    else
+      size=$(font_size "$3")
+      omarchy-font-set "$3" >/dev/null 2>&1
+      apply_size "$3" "$size" >/dev/null 2>&1
+      remember_size "$3" "$size"
+    fi
+    exit
+    ;;
+  _try)
+    [[ $2 == font ]] || exit
+    FONTCONFIG_FILE=$(isolated_fontconfig) setsid -f foot -a fontpick-try -o "font=$3:size=$(font_size "$3")" -T "fontpick: $3" \
+      bash -c '"$0" _sample; echo; exec bash' "$SELF" >/dev/null 2>&1
+    exit
+    ;;
+  _size)
+    [[ $2 == font ]] && step_size "$3" "$4"
+    exit
+    ;;
+  _sample)
+    sample_ansi
+    exit
+    ;;
+  _toggle)
+    if [[ -f $RUNTIME/show-pkgs ]]; then rm -f "$RUNTIME/show-pkgs"; else touch "$RUNTIME/show-pkgs"; fi
+    exit
+    ;;
+  -h | --help)
+    sed -n '2,11s/^# \{0,1\}//p' "$SELF"
+    exit
+    ;;
+esac
+
+rm -f "$RUNTIME/show-pkgs" "$RUNTIME/nerd-packages"
+
+# A freshly opened terminal can report a provisional cell size until its
+# HiDPI scale settles; wait for two matching readings before drawing.
+prev=""
+for _ in {1..20}; do
+  now=$(cell_size)
+  [[ -n $now && $now == "$prev" ]] && break
+  prev=$now
+  sleep 0.1
+done
+
+list_rows | fzf --ansi \
+  --delimiter=$'\t' --with-nth=2 \
+  --layout=reverse --info=inline-right \
+  --prompt='font › ' \
+  --header=$'enter apply/install · ctrl-↑/↓ size · ctrl-t try in foot · ctrl-a more Nerd Fonts · esc quit' \
+  --preview="$SELF _preview {1} {3}" \
+  --preview-window='right,68%,border-left,<100(down,65%,border-top)' \
+  --bind="enter:transform:[[ {1} == pkg ]] && a=execute || a=execute-silent; echo \"\$a($SELF _enter {1} {3})+reload($SELF _list)+refresh-preview\"" \
+  --bind="resize:refresh-preview" \
+  --bind="ctrl-up:execute-silent($SELF _size {1} {3} 0.5)+refresh-preview" \
+  --bind="ctrl-down:execute-silent($SELF _size {1} {3} -0.5)+refresh-preview" \
+  --bind="alt-up:execute-silent($SELF _size {1} {3} 0.5)+refresh-preview" \
+  --bind="alt-down:execute-silent($SELF _size {1} {3} -0.5)+refresh-preview" \
+  --bind="ctrl-t:execute-silent($SELF _try {1} {3})" \
+  --bind="ctrl-a:execute-silent($SELF _toggle)+reload($SELF _list)" \
+  >/dev/null
