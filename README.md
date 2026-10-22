@@ -5,6 +5,8 @@ monospace fonts with a live, theme-coloured preview, set a size per font, try a
 font in a real terminal window, and apply it system-wide. It can also install
 Nerd Fonts from the Arch repos.
 
+![fontpick previewing JetBrainsMono Nerd Font](assets/screenshot.png)
+
 ## Features
 
 - **Accurate previews**: rendered with pango at the size your terminal would
