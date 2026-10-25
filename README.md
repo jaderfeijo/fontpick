@@ -39,10 +39,12 @@ Nerd Fonts from the Arch repos.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jaderfeijo/fontpick/main/fontpick -o ~/.local/bin/fontpick
-chmod +x ~/.local/bin/fontpick
+curl -fsSL https://raw.githubusercontent.com/jaderfeijo/fontpick/main/install.sh | bash
 fontpick
 ```
+
+It puts `fontpick` in `~/.local/bin` and installs any missing dependency with `omarchy-pkg-add`. Run it again to
+update; `... | bash -s -- --uninstall` removes it.
 
 ## Notes
 
